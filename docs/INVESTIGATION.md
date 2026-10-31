@@ -41,13 +41,20 @@ The kernel-internal *why* (an off-by-one/cluster-bookkeeping effect in the FATX 
 path of 17559) stays unknown. It appears conditional on medium/dirent state: reports
 come from FATX-HDD setups; a FAT32/USB copy was not testable here.
 
-### Fix & verification
-- `fw_restore()`: wait 800 ms past the read (measured death window +150…300 ms),
-  then rewrite both files (`FILE_OVERWRITE_IF` + `NtWriteFile`) from the RAM copy.
-- `.bak` read fallback in `load_firmware()` + `get-firmware.ps1` creates the reserve.
-- Verified over multiple boots: read → GONE → `fw: restore … status=0 bytes=70620` →
-  PRESENT, `SIZE=70620` over FTP, **boots without any manual copying**, power-cut
-  self-heal included (torn main file boots from `.bak`, RAM copy recreates main).
+### Fix & verification (two stages)
+1. **Measured intermediate – `fw_restore`:** wait 800 ms past the read (death window
+   +150…300 ms), rewrite main + `.bak` from the RAM copy (`FILE_OVERWRITE_IF` +
+   `NtWriteFile`), `.bak` read fallback. Verified over multiple boots: read → GONE →
+   `fw: restore … status=0 bytes=70620` → PRESENT, boots without copying,
+   power-cut self-heal. (Prototype kept in the session history; later dropped again.)
+2. **Final design – the embedded variant:** don't read the file at all. A patcher
+   (`tools/embed_firmware.py`) finds a `FWEMBLOB` marker in the built xex, writes
+   offset+length and appends the blob; the plugin prefers the blob (one positioned
+   `NtReadFile` on its **own** xex) → **zero file I/O on the FATX volume**, so the
+   destruction cannot be triggered. Unpatched builds keep the original file behaviour.
+   `get-firmware` asks once: *Original* (Jacckii's workflow, just the `.bin`) or
+   *Embed* (patch the xex, remove the loose file after a verified patch). A 0-byte
+   file now counts as missing instead of dead-ending the boot.
 
 ---
 
@@ -109,5 +116,7 @@ this console, while achievement toasts (XAM's own renderer) worked.
 
 ## Related fixes in this repository
 
-- `Fix firmware file destroyed after boot read…` — `fw_restore` + `.bak` fallback.
+- `Add embedded-firmware variant…` — `FWEMBLOB` marker + blob loader (zero file
+  I/O) + `get-firmware` Original/Embed choice + 0-byte-file fix. *(Supersedes the
+  intermediate `fw_restore`/`.bak` prototype from the same investigation.)*
 - `Fix missing on-screen notifications…` — driver-thread inline notify + TLS bind.
