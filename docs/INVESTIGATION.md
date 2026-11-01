@@ -36,25 +36,61 @@ the adapter connected the xone_dongle_02fe.bin gets deleted").
    indefinitely → the trigger is the read, not the plugin's mere existence.
 4. **Skip-read test** (`XA_SKIP_FW`): without the read the file lives forever.
 
-### What we do *not* know
-The kernel-internal *why* (an off-by-one/cluster-bookkeeping effect in the FATX read
-path of 17559) stays unknown. It appears conditional on medium/dirent state: reports
-come from FATX-HDD setups; a FAT32/USB copy was not testable here.
+### Root cause (resolved upstream after this session: the ninth kernel-call argument)
 
-### Fix & verification (two stages)
+What stayed open here — the kernel-internal *why* — was closed by upstream commit
+`f82c268` („Keep the firmware files: pass NtCreateFile's ninth argument where the
+kernel reads it"): **`NtCreateFile` takes nine arguments; clang (32-bit PPC ABI) puts
+the ninth — the create options — on the stack at `96(r1)`, while the 360 kernel
+(64-bit-register ABI) reads it from `0x54(r1)`.** The kernel therefore consumed stale
+stack data as create options, and with `FILE_DELETE_ON_CLOSE` among those bits the file
+deleted itself as soon as the plugin closed the handle. No delete API call was ever
+seen (point 2 above) precisely because the deletion rides the close path.
+
+That mechanism retro-explains every measurement this session produced:
+
+- **The flag matrix showed "flags don't matter"** — `attr`/`share`/`disp` are
+  arguments 6–8 (registers, they arrived); `opt` was the *ninth* argument and never
+  reached the kernel at all. We had varied a variable the kernel never read.
+- **Boot-dependent `c0000103` (STATUS_NOT_A_DIRECTORY) on every file of the volume** —
+  stale options containing `FILE_DIRECTORY_FILE` make the kernel treat a file open as a
+  directory open. Call-site dependent, not file dependent; the FTP server's own opens
+  (different binary, different stack) never saw it.
+- **The "kill window" (early opens destroy, late opens mostly survive)** — the stack
+  slot's content changes as the driver thread runs (`wait_ms` loops overwrite it):
+  early it carried the delete/directory bits, later not. Timing correlated, the kernel
+  was not on a timer.
+- **Failed opens were harmless** — no handle, no close, nothing to delete.
+
+So the *fix* is the ABI correction (`xa_kcall9` in `thunks.s`, rule added to
+`docs/INTERNALS.md`); the file-based workflow became safe with it. The measurements
+above remain the evidence for *how the symptom looked* before that fix existed.
+
+### Fix & verification (three stages)
 1. **Measured intermediate – `fw_restore`:** wait 800 ms past the read (death window
    +150…300 ms), rewrite main + `.bak` from the RAM copy (`FILE_OVERWRITE_IF` +
    `NtWriteFile`), `.bak` read fallback. Verified over multiple boots: read → GONE →
    `fw: restore … status=0 bytes=70620` → PRESENT, boots without copying,
    power-cut self-heal. (Prototype kept in the session history; later dropped again.)
-2. **Final design – the embedded variant:** don't read the file at all. A patcher
-   (`tools/embed_firmware.py`) finds a `FWEMBLOB` marker in the built xex, writes
-   offset+length and appends the blob; the plugin prefers the blob (one positioned
-   `NtReadFile` on its **own** xex) → **zero file I/O on the FATX volume**, so the
-   destruction cannot be triggered. Unpatched builds keep the original file behaviour.
-   `get-firmware` asks once: *Original* (Jacckii's workflow, just the `.bin`) or
-   *Embed* (patch the xex, remove the loose file after a verified patch). A 0-byte
-   file now counts as missing instead of dead-ending the boot.
+2. **Intermediate design – the appended blob:** don't read the *firmware* file. A
+   patcher (`tools/embed_firmware.py`, kept in the session history) appended the blob
+   after the xex and the plugin read it back through its own image file. This proved
+   the zero-I/O principle but still performed one file open of `xa.xex` itself — and
+   the very bug above could eat *that* file, which ended this variant's life.
+3. **Final design – the `XAFWSLOT`:** the firmware lives in a fixed-size const slot
+   inside the mapped image (`fw_slot.h`; emitted always by `fw_to_c.py`, filled at
+   build time or left empty for distribution). The plugin copies it **from mapped
+   memory at t=0 — zero file I/O, no open, no create options, nothing on the FATX
+   volume involved**. The shipped `dist/xa.xex` carries an empty slot (no firmware
+   bytes in the repo); `tools/patch_slot.py` fills it in place after download —
+   same safety as a compile-in, no toolchain needed. `get-firmware` asks once:
+   **[E]** patches the slot (removes the loose 02fe file afterwards, keeps 02e6) or
+   **[O]** keeps the classic file workflow, which upstream's `xa_kcall9` fix made safe.
+   A 0-byte file counts as missing instead of dead-ending the boot.
+
+   Verified on the console: `firmware 70620 bytes from ROM slot (mapped image)` at
+   t≈0.01 s, `state=9 RUNNING`, ready-toast, `xa.xex` intact over consecutive
+   reboots, no firmware file present on the console at all.
 
 ---
 
@@ -116,7 +152,13 @@ this console, while achievement toasts (XAM's own renderer) worked.
 
 ## Related fixes in this repository
 
-- `Add embedded-firmware variant…` — `FWEMBLOB` marker + blob loader (zero file
-  I/O) + `get-firmware` Original/Embed choice + 0-byte-file fix. *(Supersedes the
-  intermediate `fw_restore`/`.bak` prototype from the same investigation.)*
-- `Fix missing on-screen notifications…` — driver-thread inline notify + TLS bind.
+- **Upstream** (merged before this branch): `f82c268` — `xa_kcall9` puts the ninth
+  `NtCreateFile` argument where the kernel reads it (the root cause above); `3093673` —
+  original adapter `045e:02e6` support; `4559549` — on-screen *firmware missing*
+  notices. *(The appended-blob and `fw_restore` variants of this investigation are
+  superseded by the slot below.)*
+- `Add the XAFWSLOT…` (PR 1) — firmware inside the mapped image, read at t=0 with
+  zero file I/O; `tools/patch_slot.py` fills the slot without a toolchain
+  (`get-firmware [E]`); 0-byte-file fix.
+- `Fix missing on-screen notifications…` (PR 2) — driver-thread inline notify + TLS
+  bind; also what makes the upstream *firmware missing* toasts actually appear.
