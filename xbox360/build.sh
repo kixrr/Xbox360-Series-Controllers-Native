@@ -20,7 +20,7 @@ DLL_LINK="-Wl,/entry:DllMain,/align:0x1000"
 # No floating point: DLL code runs on the kernel's DPCs, which have no FP context, and
 # the ppc32 ABI's variadic prologue spills f1-f8 unconditionally (stfd) in every printf-
 # style function. check_xex.py fails the build on any FP instruction.
-CFLAGS_DLL="-fno-zero-initialized-in-bss -msoft-float"
+CFLAGS_DLL="-fno-zero-initialized-in-bss -msoft-float -I."
 # XA_HOOKS picks the installed XInput hooks (default: read,caps,set; "read" = input only)
 case "${XA_HOOKS:-read,caps,set}" in
     *caps*) CFLAGS_DLL="$CFLAGS_DLL -DXA_HOOK_CAPS=1" ;;
@@ -50,11 +50,15 @@ fi
 # micro-ecc: only P-256, portable C (no assembly)
 ECC_FLAGS="-DuECC_SUPPORTS_secp160r1=0 -DuECC_SUPPORTS_secp192r1=0 -DuECC_SUPPORTS_secp224r1=0
     -DuECC_SUPPORTS_secp256k1=0 -DuECC_PLATFORM=uECC_arch_other"
+# firmware as a const .rodata array: the plugin reads it from its own mapped image -
+# no file open, no FATX dirent risk (the kill window), available from t=0.
+# XA_FW=/path/to/fw.bin overrides; missing file -> empty stub (fallbacks stay active).
+python3 fw_to_c.py out/fw_rom.c
 CORE="../core/mt76.c ../core/dongle.c ../core/gip.c ../core/sha256.c ../third_party/micro-ecc/uECC.c"
 
 $TC/bin/clang -O2 -Wall -Wno-unused-parameter $CFLAGS_DLL $ECC_FLAGS $DLL_LINK,/base:$BASE \
     -DXA_NAME="\"$NAME.xex\"" \
-    thunks.s xa_plugin.c platform_360.c xinput_360.c detour.c $CORE -o out/$NAME.exe
+    thunks.s xa_plugin.c platform_360.c xinput_360.c detour.c out/fw_rom.c $CORE -o out/$NAME.exe
 $TC/bin/synthxex-patched -i out/$NAME.exe -o out/$NAME.xex -t sysdll >/dev/null
 
 $TC/bin/clang -O2 loader.c -Wl,/entry:stage_entry -DPLUGIN_NAME="\"$NAME.xex\"" \

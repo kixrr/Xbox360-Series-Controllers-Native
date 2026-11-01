@@ -20,6 +20,7 @@
 #include "../core/platform.h"
 #include "platform_360.h"
 #include "xinput_360.h"
+#include "fw_slot.h"
 
 #define BARRIER() __asm__ __volatile__("lwsync" ::: "memory")
 
@@ -519,6 +520,12 @@ static u8 *load_firmware_at(const char *path, u32 *len, NTSTATUS *status)
 	NtClose(file);
 	*len = total;
 	xa_log("xa: firmware %u bytes from %s\n", total, path);
+	if (!total) {
+		/* a truncated (0-byte) file must NOT count as success: return NULL so
+		 * callers keep looking instead of dead-ending the boot in XA_NO_FIRMWARE */
+		free(buf);
+		return NULL;
+	}
 	return buf;
 }
 
@@ -571,6 +578,23 @@ static u8 *load_firmware(const char *name, u32 *len, bool *logged_once)
 	u8 *fw;
 	int n;
 
+	/* source 0: the XAFWSLOT inside this image (fw_to_c.py at build time, or
+	 * tools/patch_slot.py after download - get-firmware [E]). It holds the slim
+	 * adapter's (02fe) firmware; the original adapter (02e6) keeps using files.
+	 * The slot lives in the mapped image: read at t=0 with ZERO file I/O, so no
+	 * open, no FATX dirent exposure and no create-options involved. A copy keeps
+	 * the caller's free() contract. */
+	if (!strcmp(name, adapters[0].firmware) && xa_fw_slot.len >= 1024 &&
+	    xa_fw_slot.len <= FIRMWARE_MAX) {
+		fw = malloc(xa_fw_slot.len);
+		if (!fw)
+			return NULL;
+		memcpy(fw, xa_fw_slot.data, xa_fw_slot.len);
+		*len = xa_fw_slot.len;
+		if (!logged)
+			xa_log("xa: firmware %u bytes from ROM slot (mapped image)\n", *len);
+		return fw;
+	}
 	n = module_dir(path);
 	if (n > 0 && path_append(path, n, name) > 0) {
 		if ((fw = load_firmware_at(path, len, &st)))
